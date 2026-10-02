@@ -6,31 +6,28 @@ function Invoke-WPFFeatureInstall {
 
     #>
 
-    if($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFFeatureInstall] Install process is currently running."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if ($null -eq $sync.selectedFeatures -or $sync.selectedFeatures.Count -eq 0) {
+        Show-WinUtilMessage -Message "No Windows Feature selected" -Title "WinUtil" -Button "OK" -Icon "Warning"
         return
     }
 
-    $Features = (Get-WinUtilCheckBoxes)["WPFFeature"]
+    Start-WinUtilJob -Name "Features" -Description "Installing Windows features" -Parameters @{
+        Features = @($sync.selectedFeatures)
+    } -ScriptBlock {
+        param($Features)
 
-    Invoke-WPFRunspace -ArgumentList $Features -DebugPreference $DebugPreference -ScriptBlock {
-        param($Features, $DebugPreference)
-        $sync.ProcessRunning = $true
-        if ($Features.count -eq 1) {
-            $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" })
-        } else {
-            $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" })
+        $total = @($Features).Count
+        $completed = 0
+
+        foreach ($feature in $Features) {
+            $completed++
+            Step-WinUtilJob -Status "Installing $feature ($completed/$total)" -Percent ([int]((($completed - 1) / $total) * 100))
+            Measure-WinUtilStep -Scope "Features" -Name $feature -ScriptBlock {
+                Invoke-WinUtilFeatureInstall $feature
+            }
+            Step-WinUtilJob -Status "Installed $feature ($completed/$total)" -Percent ([int](($completed / $total) * 100))
         }
 
-        Invoke-WinUtilFeatureInstall $Features
-
-        $sync.ProcessRunning = $false
-        $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" })
-
-        Write-Host "==================================="
-        Write-Host "---   Features are Installed    ---"
-        Write-Host "---  A Reboot may be required   ---"
-        Write-Host "==================================="
+        Write-Host "A reboot may be required."
     }
 }

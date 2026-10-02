@@ -6,57 +6,59 @@ function Invoke-WPFtweaksbutton {
 
   #>
 
-  if($sync.ProcessRunning) {
-    $msg = "[Invoke-WPFtweaksbutton] Install process is currently running."
-    [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+  $Tweaks = $sync.selectedTweaks
+  $dnsProvider = $sync["WPFchangedns"].text
+  if (-not ($dnsProvider)) {
+    $dnsProvider = "Default"
+  }
+
+  if ($Tweaks.count -eq 0 -and $dnsProvider -eq "Default") {
+    Show-WinUtilMessage -Message "Please check the tweaks you wish to perform." -Title "WinUtil" -Button "OK" -Icon "Warning"
     return
   }
 
-  $Tweaks = (Get-WinUtilCheckBoxes)["WPFTweaks"]
+  Write-WinUtilLog -Component "Tweaks" -Message "Tweaks requested: $(@($Tweaks).Count) selected tweak(s), DNS provider: $dnsProvider"
 
-  Set-WinUtilDNS -DNSProvider $sync["WPFchangedns"].text
+  Start-WinUtilJob -Name "Tweaks" -Description "Applying tweaks" -Parameters @{
+    Tweaks = @($Tweaks)
+    DnsProvider = $dnsProvider
+  } -ScriptBlock {
+    param($Tweaks, $DnsProvider)
 
-  if ($tweaks.count -eq 0 -and  $sync["WPFchangedns"].text -eq "Default") {
-    $msg = "Please check the tweaks you wish to perform."
-    [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-    return
-  }
+    # The restore point has to be taken before anything else changes
+    $restorePointTweak = "WPFTweaksRestorePoint"
+    $tweaksToRun = @($Tweaks | Where-Object { $_ -ne $restorePointTweak })
+    $totalSteps = [Math]::Max(@($Tweaks).Count, 1)
+    $completedSteps = 0
 
-  Write-Debug "Number of tweaks to process: $($Tweaks.Count)"
-
-  # The leading "," in the ParameterList is nessecary because we only provide one argument and powershell cannot be convinced that we want a nested loop with only one argument otherwise
-  Invoke-WPFRunspace -ParameterList @(,("tweaks",$tweaks)) -DebugPreference $DebugPreference -ScriptBlock {
-    param(
-      $tweaks,
-      $DebugPreference
-      )
-    Write-Debug "Inside Number of tweaks to process: $($Tweaks.Count)"
-
-    $sync.ProcessRunning = $true
-
-    if ($Tweaks.count -eq 1) {
-        $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" })
-    } else {
-        $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" })
+    if ($Tweaks -contains $restorePointTweak) {
+      Step-WinUtilJob -Status "Creating restore point" -Percent 0
+      Write-WinUtilLog -Component "Tweaks" -Message "Creating restore point before applying selected tweaks."
+      Measure-WinUtilStep -Scope "Tweaks" -Name $restorePointTweak -ScriptBlock {
+        Invoke-WinUtilTweaks $restorePointTweak
+      }
+      $completedSteps = 1
     }
-    # Execute other selected tweaks
 
-    for ($i = 0; $i -lt $Tweaks.Count; $i++) {
-      Set-WinUtilProgressBar -Label "Applying $($tweaks[$i])" -Percent ($i / $tweaks.Count * 100)
-      Invoke-WinUtilTweaks $tweaks[$i]
-      $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -value ($i/$Tweaks.Count) })
+    if ($DnsProvider -ne "Default") {
+      $dnsResult = Measure-WinUtilStep -Scope "Tweaks" -Name "Set DNS to $DnsProvider" -ScriptBlock {
+        @(Set-WinUtilDNS -DNSProvider $DnsProvider)
+      }
+
+      # Carrying on after the DNS change failed leaves the machine half configured, so the run
+      # ends here and the job layer reports it
+      if (@($dnsResult)[-1] -ne $true) {
+        throw "The DNS change to $DnsProvider failed, so the remaining tweaks were not applied."
+      }
     }
-    Set-WinUtilProgressBar -Label "Tweaks finished" -Percent 100
-    $sync.ProcessRunning = $false
-    $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" })
-    Write-Host "================================="
-    Write-Host "--     Tweaks are Finished    ---"
-    Write-Host "================================="
 
-    # $ButtonType = [System.Windows.MessageBoxButton]::OK
-    # $MessageboxTitle = "Tweaks are Finished "
-    # $Messageboxbody = ("Done")
-    # $MessageIcon = [System.Windows.MessageBoxImage]::Information
-    # [System.Windows.MessageBox]::Show($Messageboxbody, $MessageboxTitle, $ButtonType, $MessageIcon)
+    foreach ($tweak in $tweaksToRun) {
+      Step-WinUtilJob -Status "Applying $tweak ($($completedSteps + 1)/$totalSteps)" -Percent ([int](($completedSteps / $totalSteps) * 100))
+      Measure-WinUtilStep -Scope "Tweaks" -Name $tweak -ScriptBlock {
+        Invoke-WinUtilTweaks $tweak
+      }
+      $completedSteps++
+      Step-WinUtilJob -Percent ([int](($completedSteps / $totalSteps) * 100))
+    }
   }
 }

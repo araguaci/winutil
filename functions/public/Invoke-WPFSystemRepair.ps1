@@ -1,137 +1,62 @@
 function Invoke-WPFSystemRepair {
     <#
     .SYNOPSIS
-        Checks for system corruption using Chkdsk, SFC, and DISM
+        Checks for system corruption using SFC, and DISM
+        Checks for disk failure using Chkdsk
 
     .DESCRIPTION
-        1. Chkdsk    - Fixes disk and filesystem corruption
-        2. SFC Run 1 - Fixes system file corruption, and fixes DISM if it was corrupted
-        3. DISM      - Fixes system image corruption, and fixes SFC's system image if it was corrupted
-        4. SFC Run 2 - Fixes system file corruption, this time with an almost guaranteed uncorrupted system image
+        1. Chkdsk - Checks for disk errors, which can cause system file corruption and notifies of early disk failure
+        2. SFC - scans protected system files for corruption and fixes them
+        3. DISM - Repair a corrupted Windows operating system image
     #>
 
-    function Invoke-Chkdsk {
-        <#
-        .SYNOPSIS
-            Runs chkdsk on the system drive
-        .DESCRIPTION
-            Chkdsk /Scan - Runs an online scan on the system drive, attempts to fix any corruption, and queues other corruption for fixing on reboot
-        #>
-        param(
-            [int]$parentProgressId = 0
-        )
-
-        Write-Progress -Id 1 -ParentId $parentProgressId -Activity $childProgressBarActivity -Status "Running chkdsk..." -PercentComplete 0
-        $oldpercent = 0
-        # 2>&1 redirects stdout, allowing iteration over the output
-        chkdsk.exe /scan /perf 2>&1 | ForEach-Object {
-            Write-Debug $_
-            # Regex to match the total percentage regardless of windows locale (it's always the second percentage in the status output)
-            if ($_ -match "%.*?(\d+)%") {
-                [int]$percent = $matches[1]
-                if ($percent -gt $oldpercent) {
-                    Write-Progress -Id 1 -Activity $childProgressBarActivity -Status "Running chkdsk... ($percent%)" -PercentComplete $percent
-                    $oldpercent = $percent
-                }
+    # SuccessCodes maps the non-zero exits a step treats as success to what they mean. The codes
+    # are per step because the same number means different things: 1 and 2 are ordinary chkdsk
+    # outcomes, while 1 from sfc is a failure, and 3010 is a repaired image from DISM only.
+    $steps = @(
+        @{
+            Label = "Checking the disk for errors"
+            Arguments = "/c chkdsk /scan /perf"
+            # 3 is left out: the disk could not be checked, or has errors an online scan cannot
+            # fix, and the steps after this one are not worth running on a disk in that state.
+            SuccessCodes = @{
+                1 = "errors were found and fixed"
+                2 = "cleanup was performed, or was skipped because /f was not given"
+            }
+        },
+        @{
+            Label = "Scanning protected system files"
+            Arguments = "/c sfc /scannow"
+            SuccessCodes = @{}
+        },
+        @{
+            Label = "Repairing the Windows image"
+            Arguments = "/c dism /online /cleanup-image /restorehealth"
+            SuccessCodes = @{
+                3010 = "a restart is needed for the repair to take effect"
             }
         }
-        Write-Progress -Id 1 -Activity $childProgressBarActivity -Status "chkdsk Completed" -PercentComplete 100 -Completed
-    }
+    )
 
-    function Invoke-SFC {
-        <#
-        .SYNOPSIS
-            Runs sfc on the system drive
-        .DESCRIPTION
-            SFC /ScanNow - Performs a scan of the system files and fixes any corruption
-        .NOTES
-            ErrorActionPreference is set locally within a script block & {...} to isolate their effects.
-            ErrorActionPreference suppresses false errors caused by sfc.exe output redirection.
-            A bug in SFC output buffering causes progress updates to appear in chunks when redirecting output
-        #>
-        param(
-            [int]$parentProgressId = 0
-        )
-        & {
-            $ErrorActionPreference = "SilentlyContinue"
-            Write-Progress -Id 1 -ParentId $parentProgressId -Activity $childProgressBarActivity -Status "Running SFC..." -PercentComplete 0
-            $oldpercent = 0
-            sfc.exe /scannow 2>&1 | ForEach-Object {
-                Write-Debug $_
-                if ($_ -ne "") {
-                    # sfc.exe /scannow outputs unicode characters, so we directly remove null characters for optimization
-                    $utf8line = $_ -replace "`0", ""
-                    if ($utf8line -match "(\d+)\s*%") {
-                        [int]$percent = $matches[1]
-                        if ($percent -gt $oldpercent) {
-                            Write-Progress -Id 1 -Activity $childProgressBarActivity -Status "Running SFC... ($percent%)" -PercentComplete $percent
-                            $oldpercent = $percent
-                        }
-                    }
-                }
-            }
-            Write-Progress -Id 1 -Activity $childProgressBarActivity -Status "SFC Completed" -PercentComplete 100 -Completed
-        }
-    }
+    $completed = 0
+    foreach ($step in $steps) {
+        Step-WinUtilJob -Status "$($step.Label) ($($completed + 1)/$($steps.Count))" -Percent ([int](($completed / $steps.Count) * 100))
+        Write-WinUtilLog -Component "SystemRepair" -Message $step.Label
+        # Start-Process does not throw on a nonzero exit, so without this a failed chkdsk, sfc
+        # or dism run would still be reported as a completed repair
+        $process = Start-Process cmd.exe -ArgumentList $step.Arguments -NoNewWindow -Wait -PassThru
+        $exitCode = $process.ExitCode
 
-    function Invoke-DISM {
-        <#
-        .SYNOPSIS
-            Runs DISM on the system drive
-        .DESCRIPTION
-            DISM                - Fixes system image corruption, and fixes SFC's system image if it was corrupted
-              /Online           - Fixes the currently running system image
-              /Cleanup-Image    - Performs cleanup operations on the image, could remove some unneeded temporary files
-              /Restorehealth    - Performs a scan of the image and fixes any corruption
-        #>
-        param(
-            [int]$parentProgressId = 0
-        )
-        Write-Progress -Id 1 -ParentId $parentProgressId -Activity $childProgressBarActivity -Status "Running DISM..." -PercentComplete 0
-        $oldpercent = 0
-        DISM /Online /Cleanup-Image /RestoreHealth | ForEach-Object {
-            Write-Debug $_
-            # Filter for lines that contain a percentage that is greater than the previous one
-            if ($_ -match "(\d+)[.,]\d+%") {
-                [int]$percent = $matches[1]
-                if ($percent -gt $oldpercent) {
-                    # Update the progress bar
-                    Write-Progress -Id 1 -Activity $childProgressBarActivity -Status "Running DISM... ($percent%)" -PercentComplete $percent
-                    $oldpercent = $percent
-                }
+        if ($exitCode -ne 0) {
+            if ($step.SuccessCodes.ContainsKey($exitCode)) {
+                # Start-WinUtilJob records WarningRecord output in both the session log and the
+                # job result, so accepted nonzero outcomes cannot finish with a green checkmark.
+                Write-Warning "$($step.Label) finished: $($step.SuccessCodes[$exitCode])."
+            } else {
+                throw "$($step.Label) failed with exit code $exitCode."
             }
         }
-        Write-Progress -Id 1 -Activity $childProgressBarActivity -Status "DISM Completed" -PercentComplete 100 -Completed
+
+        $completed++
     }
-
-    try {
-        Set-WinUtilTaskbaritem -state "Indeterminate" -overlay "logo"
-
-        $childProgressBarActivity = "Scanning for corruption"
-        Write-Progress -Id 0 -Activity "Repairing Windows" -PercentComplete 0
-        # Step 1: Run chkdsk to fix disk and filesystem corruption before proceeding with system file repairs
-        Invoke-Chkdsk
-        Write-Progress -Id 0 -Activity "Repairing Windows" -PercentComplete 25
-
-        # Step 2: Run SFC to fix system file corruption and ensure DISM can operate correctly
-        Invoke-SFC
-        Write-Progress -Id 0 -Activity "Repairing Windows" -PercentComplete 50
-
-        # Step 3: Run DISM to repair the system image, which SFC relies on for accurate repairs
-        Invoke-DISM
-        Write-Progress -Id 0 -Activity "Repairing Windows" -PercentComplete 75
-
-        # Step 4: Run SFC again to ensure system files are repaired using the now-fixed system image
-        Invoke-SFC
-        Write-Progress -Id 0 -Activity "Repairing Windows" -PercentComplete 100 -Completed
-
-        Set-WinUtilTaskbaritem -state "None" -overlay "checkmark"
-    } catch {
-        Write-Error "An error occurred while repairing the system: $_"
-        Set-WinUtilTaskbaritem -state "Error" -overlay "warning"
-    } finally {
-        Write-Host "==> Finished System Repair"
-        Set-WinUtilTaskbaritem -state "None" -overlay "checkmark"
-    }
-
 }

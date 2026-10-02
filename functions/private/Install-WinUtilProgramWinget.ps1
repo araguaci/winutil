@@ -1,169 +1,116 @@
 Function Install-WinUtilProgramWinget {
     <#
+
     .SYNOPSIS
-    Runs the designated action on the provided programs using Winget
+        Installs or uninstalls packages with WinGet and reports the outcome of each one
 
-    .PARAMETER Programs
-    A list of programs to process
+    .DESCRIPTION
+        Emits one result object per package so the caller can tell what actually happened
+        rather than assuming the run succeeded.
 
-    .PARAMETER action
-    The action to perform on the programs, can be either 'Install' or 'Uninstall'
+        Runs one winget command per package so a failure names the package that failed rather
+        than the whole batch. Progress moves per package: winget hides its own progress bar once
+        its output is redirected, so there is nothing to report from inside a single install.
 
-    .NOTES
-    The triple quotes are required any time you need a " in a normal script block.
-    The winget Return codes are documented here: https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-actionr/winget/returnCodes.md
     #>
+    param (
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Install", "Uninstall", "Upgrade")]
+        [string]$Action,
 
-    param(
-        [Parameter(Mandatory, Position=0)]$Programs,
-
-        [Parameter(Mandatory, Position=1)]
-        [ValidateSet("Install", "Uninstall")]
-        [String]$Action
+        [Parameter(Mandatory=$true)]
+        [string[]]$Programs
     )
 
-    Function Invoke-Winget {
-    <#
-    .SYNOPSIS
-    Invokes the winget.exe with the provided arguments and return the exit code
+    # APPINSTALLER_CLI_ERROR_ADMIN_CONTEXT_ACTION_PROHIBITED. WinGet refuses to act on a package
+    # that was installed in user scope while it is running elevated, and WinUtil is always
+    # elevated, so every per-user app answers this and nothing happens.
+    $adminContextProhibited = -1978335107
 
-    .PARAMETER wingetId
-    The Id of the Program that Winget should Install/Uninstall
-
-    .PARAMETER scope
-    Determines the installation mode. Can be "user" or "machine" (For more info look at the winget documentation)
-
-    .PARAMETER credential
-    The PSCredential Object of the user that should be used to run winget
-
-    .NOTES
-    Invoke Winget uses the public variable $Action defined outside the function to determine if a Program should be installed or removed
-    #>
-        param (
-            [string]$wingetId,
-            [string]$scope = "",
-            [PScredential]$credential = $null
-        )
-
-        $commonArguments = "--id $wingetId --silent"
-        $arguments = if ($Action -eq "Install") {
-            "install $commonArguments --accept-source-agreements --accept-package-agreements $(if ($scope) {" --scope $scope"})"
-        } else {
-            "uninstall $commonArguments"
-        }
-
-        $processParams = @{
-            FilePath = "winget"
-            ArgumentList = $arguments
-            Wait = $true
-            PassThru = $true
-            NoNewWindow = $true
-        }
-
-        if ($credential) {
-            $processParams.credential = $credential
-        }
-
-        return (Start-Process @processParams).ExitCode
+    # WinGet reports "there was nothing to do" through the exit code rather than as success
+    $nothingToDo = @{
+        -1978335135 = "already installed"
+        -1978335189 = "no applicable update"
+    }
+    # The installer worked and wants a restart to finish. Windows reports that as its own exit
+    # code rather than as zero, and treating it as a failure marks working installs as broken.
+    $rebootExitCodes = @{
+        3010 = "installed, a restart is needed to finish"
+        1641 = "installed, the installer started a restart"
+        # WinGet's own equivalents. -1978334966 is deliberately absent: it means a reboot is
+        # required before the install can proceed, which is not a completed install.
+        -1978334967 = "installed, a restart is needed to finish"
+        -1978334965 = "installed, the installer started a restart"
     }
 
-    Function Invoke-Install {
-    <#
-    .SYNOPSIS
-    Contains the Install Logic and return code handling from winget
-
-    .PARAMETER Program
-    The Winget ID of the Program that should be installed
-    #>
-        param (
-            [string]$Program
-        )
-        $status = Invoke-Winget -wingetId $Program
-        if ($status -eq 0) {
-            Write-Host "$($Program) installed successfully."
-            return $true
-        } elseif ($status -eq -1978335189) {
-            Write-Host "$($Program) No applicable update found"
-            return $true
+    foreach ($program in $Programs) {
+        if ([string]::IsNullOrWhiteSpace($program) -or $program -eq "na") {
+            continue
         }
 
-        Write-Host "Attempt installation of $($Program) with User scope"
-        $status = Invoke-Winget -wingetId $Program -scope "user"
-        if ($status -eq 0) {
-            Write-Host "$($Program) installed successfully with User scope."
-            return $true
-        } elseif ($status -eq -1978335189) {
-            Write-Host "$($Program) No applicable update found"
-            return $true
+        $upgradeAll = $Action -eq "Upgrade" -and $program -eq "all"
+        $source = if ($upgradeAll) { "all configured sources" } else { "winget" }
+        if (-not $upgradeAll -and $program.StartsWith("msstore:", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $source = "msstore"
+            $program = $program.Substring("msstore:".Length)
         }
 
-        $userChoice = [System.Windows.MessageBox]::Show("Do you want to attempt $($Program) installation with specific user credentials? Select 'Yes' to proceed or 'No' to skip.", "User credential Prompt", [System.Windows.MessageBoxButton]::YesNo)
-        if ($userChoice -eq 'Yes') {
-            $getcreds = Get-Credential
-            $status = Invoke-Winget -wingetId $Program -credential $getcreds
-            if ($status -eq 0) {
-                Write-Host "$($Program) installed successfully with User prompt."
-                return $true
+        Write-WinUtilLog -Component "Package" -Message "$Action winget package: $program (source: $source)"
+
+        $outcome = "Failed"
+        $detail = "no result"
+        $exitCode = -1
+
+        $arguments = switch ($Action) {
+            "Uninstall" { @("uninstall", "--id", $program, "--source", $source, "--silent") }
+            # --include-unknown because the scan that found these ran with it: without it winget
+            # refuses every package whose installed version it could not read
+            "Upgrade" {
+                if ($upgradeAll) {
+                    @("upgrade", "--all", "--accept-package-agreements", "--accept-source-agreements", "--include-unknown", "--silent")
+                } else {
+                    @("upgrade", "--id", $program, "--accept-package-agreements", "--accept-source-agreements", "--source", $source, "--include-unknown", "--silent")
+                }
+            }
+            default     { @("install", "--id", $program, "--accept-package-agreements", "--accept-source-agreements", "--source", $source, "--silent") }
+        }
+
+        $process = Start-Process -FilePath winget -ArgumentList $arguments -NoNewWindow -Wait -PassThru
+        $exitCode = $process.ExitCode
+
+        if ($exitCode -eq 0) {
+            $outcome = "Succeeded"
+            $detail = "exit code 0"
+        } elseif ($rebootExitCodes.ContainsKey($exitCode)) {
+            $outcome = "Succeeded"
+            $detail = $rebootExitCodes[$exitCode]
+        } elseif ($nothingToDo.ContainsKey($exitCode)) {
+            $outcome = "Skipped"
+            $detail = $nothingToDo[$exitCode]
+        } elseif ($exitCode -eq $adminContextProhibited) {
+            $outcome = "Skipped"
+            $detail = switch ($Action) {
+                "Install" { "already installed for the current user; elevated WinUtil cannot update it" }
+                "Upgrade" { "not upgraded; installed for the current user and elevated WinUtil cannot modify it" }
+                "Uninstall" { "remains installed for the current user; elevated WinUtil cannot uninstall it" }
             }
         } else {
-            Write-Host "Skipping installation with specific user credentials."
+            $outcome = "Failed"
+            # The client module reports the same failure as a bare HRESULT, so the hex form and
+            # Microsoft's own list serve both paths
+            $detail = "WinGet reported 0x{0:X8}. See https://learn.microsoft.com/windows/package-manager/winget/returnCodes" -f $exitCode
         }
 
-        Write-Host "Failed to install $($Program)."
-        return $false
-    }
+        $level = if ($outcome -eq "Failed") { "ERROR" } else { "INFO" }
+        Write-WinUtilLog -Level $level -Component "Package" -Message "$Action winget package $($outcome.ToLowerInvariant()): $program ($detail)"
 
-    Function Invoke-Uninstall {
-        <#
-        .SYNOPSIS
-        Contains the Uninstall Logic and return code handling from winget
-
-        .PARAMETER Program
-        The Winget ID of the Program that should be uninstalled
-        #>
-        param (
-            [psobject]$Program
-        )
-
-        try {
-            $status = Invoke-Winget -wingetId $Program
-            if ($status -eq 0) {
-                Write-Host "$($Program) uninstalled successfully."
-                return $true
-            } else {
-                Write-Host "Failed to uninstall $($Program)."
-                return $false
-            }
-        } catch {
-            Write-Host "Failed to uninstall $($Program) due to an error: $_"
-            return $false
+        [pscustomobject]@{
+            Package = $program
+            Manager = "winget"
+            Action = $Action
+            ExitCode = $exitCode
+            Outcome = $outcome
+            Detail = $detail
         }
     }
-
-    $count = $Programs.Count
-    $failedPackages = @()
-
-    Write-Host "==========================================="
-    Write-Host "--    Configuring winget packages       ---"
-    Write-Host "==========================================="
-
-    for ($i = 0; $i -lt $count; $i++) {
-        $Program = $Programs[$i]
-        $result = $false
-        Set-WinUtilProgressBar -label "$Action $($Program)" -percent ($i / $count * 100)
-        $sync.form.Dispatcher.Invoke([action]{ Set-WinUtilTaskbaritem -value ($i / $count)})
-
-        $result = switch ($Action) {
-            "Install" {Invoke-Install -Program $Program}
-            "Uninstall" {Invoke-Uninstall -Program $Program}
-            default {throw "[Install-WinUtilProgramWinget] Invalid action: $Action"}
-        }
-
-        if (-not $result) {
-            $failedPackages += $Program
-        }
-    }
-
-    Set-WinUtilProgressBar -label "$($Action)ation done" -percent 100
-    return $failedPackages
 }

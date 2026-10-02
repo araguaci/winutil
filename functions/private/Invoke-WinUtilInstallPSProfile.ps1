@@ -1,103 +1,68 @@
+function Get-WinUtilPowerShell7Path {
+    $command = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+
+    foreach ($candidate in @(
+            "$env:ProgramFiles\PowerShell\7\pwsh.exe",
+            "$env:LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe")) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+
+    return $null
+}
+
 function Invoke-WinUtilInstallPSProfile {
     <#
     .SYNOPSIS
-        Backs up your original profile then installs and applies the CTT PowerShell profile.
+        Installs the CTT PowerShell profile
+
+    .DESCRIPTION
+        The profile targets PowerShell 7, so its setup script has to run under pwsh rather than
+        the runspace this job is on. It runs as a child process with its output captured, so the
+        job log records what happened instead of it scrolling past in a terminal nobody kept.
     #>
 
-    Invoke-WPFRunspace -ArgumentList $PROFILE -DebugPreference $DebugPreference -ScriptBlock {
-        # Remap the automatic built-in $PROFILE variable to the parameter named $PSProfile.
-        param ($PSProfile)
+    $pwshPath = Get-WinUtilPowerShell7Path
+    if (-not $pwshPath) {
+        Step-WinUtilJob -Status "Installing PowerShell 7" -State "Indeterminate"
+        Write-WinUtilLog -Component "Feature" -Message "PowerShell 7 not found, installing it first."
 
-        function Invoke-PSSetup {
-            # Define the URL used to download Chris Titus Tech's PowerShell profile.
-            $url = "https://raw.githubusercontent.com/ChrisTitusTech/powershell-profile/main/Microsoft.PowerShell_profile.ps1"
+        Install-WinUtilWinget
+        Install-WinUtilProgramWinget -Action Install -Programs @("Microsoft.PowerShell") | Out-Null
 
-            # Get the file hash for the user's current PowerShell profile.
-            $OldHash = Get-FileHash $PSProfile -ErrorAction SilentlyContinue
-
-            # Download Chris Titus Tech's PowerShell profile to the 'TEMP' folder.
-            Invoke-RestMethod $url -OutFile "$env:TEMP/Microsoft.PowerShell_profile.ps1"
-
-            # Get the file hash for Chris Titus Tech's PowerShell profile.
-            $NewHash = Get-FileHash "$env:TEMP/Microsoft.PowerShell_profile.ps1"
-
-            # Store the file hash of Chris Titus Tech's PowerShell profile.
-            if (!(Test-Path "$PSProfile.hash")) {
-                $NewHash.Hash | Out-File "$PSProfile.hash"
-            }
-
-            # Check if the new profile's hash doesn't match the old profile's hash.
-            if ($NewHash.Hash -ne $OldHash.Hash) {
-                # Check if oldprofile.ps1 exists and use it as a profile backup source.
-                if (Test-Path "$env:USERPROFILE\oldprofile.ps1") {
-                    Write-Host "===> Backup File Exists... <===" -ForegroundColor Yellow
-                    Write-Host "===> Moving Backup File... <===" -ForegroundColor Yellow
-                    Copy-Item "$env:USERPROFILE\oldprofile.ps1" "$PSProfile.bak"
-                    Write-Host "===> Profile Backup: Done. <===" -ForegroundColor Yellow
-                } else {
-                    # If oldprofile.ps1 does not exist use $PSProfile as a profile backup source.
-                    # Check if the profile backup file has not already been created on the disk.
-                    if ((Test-Path $PSProfile) -and (-not (Test-Path "$PSProfile.bak"))) {
-                        # Let the user know their PowerShell profile is being backed up.
-                        Write-Host "===> Backing Up Profile... <===" -ForegroundColor Yellow
-
-                        # Copy the user's current PowerShell profile to the backup file path.
-                        Copy-Item -Path $PSProfile -Destination "$PSProfile.bak"
-
-                        # Let the user know the profile backup has been completed successfully.
-                        Write-Host "===> Profile Backup: Done. <===" -ForegroundColor Yellow
-                    }
-                }
-
-                # Let the user know Chris Titus Tech's PowerShell profile is being installed.
-                Write-Host "===> Installing Profile... <===" -ForegroundColor Yellow
-
-                # Start a new hidden PowerShell instance because setup.ps1 does not work in runspaces.
-                Start-Process -FilePath "pwsh" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -Command `"Invoke-Expression (Invoke-WebRequest `'https://github.com/ChrisTitusTech/powershell-profile/raw/main/setup.ps1`')`"" -WindowStyle Hidden -Wait
-
-                # Let the user know Chris Titus Tech's PowerShell profile has been installed successfully.
-                Write-Host "Profile has been installed. Please restart your shell to reflect the changes!" -ForegroundColor Magenta
-
-                # Let the user know Chris Titus Tech's PowerShell profile has been setup successfully.
-                Write-Host "===> Finished Profile Setup <===" -ForegroundColor Yellow
-            } else {
-                # Let the user know Chris Titus Tech's PowerShell profile is already fully up-to-date.
-                Write-Host "Profile is up to date" -ForegroundColor Magenta
-            }
-        }
-
-        # Check if PowerShell Core is currently installed as a program and is available as a command.
-        if (Get-Command "pwsh" -ErrorAction SilentlyContinue) {
-            # Check if the version of PowerShell Core currently in use is version 7 or higher.
-            if ($PSVersionTable.PSVersion.Major -ge 7) {
-                # Invoke the PowerShell Profile setup script to install Chris Titus Tech's PowerShell Profile.
-                Invoke-PSSetup
-            } else {
-                # Let the user know that PowerShell 7 is installed but is not currently in use.
-                Write-Host "This profile requires Powershell 7, which is currently installed but not used!" -ForegroundColor Red
-
-                # Load the necessary .NET library required to use Windows Forms to show dialog boxes.
-                Add-Type -AssemblyName System.Windows.Forms
-
-                # Display the message box asking if the user wants to install PowerShell 7 or not.
-                $question = [System.Windows.Forms.MessageBox]::Show(
-                    "Profile requires Powershell 7, which is currently installed but not used! Do you want to install the profile for Powershell 7?",
-                    "Question",
-                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                    [System.Windows.Forms.MessageBoxIcon]::Question
-                )
-
-                # Proceed with the installation and setup of the profile as the user pressed the 'Yes' button.
-                if ($question -eq [System.Windows.Forms.DialogResult]::Yes) {
-                    Invoke-PSSetup
-                } else {
-                    # Let the user know the setup of the profile will not proceed as they pressed the 'No' button.
-                    Write-Host "Not proceeding with the profile setup!" -ForegroundColor Magenta
-                }
-            }
-        } else {
-            # Let the user know that the profile requires PowerShell Core but it is not currently installed.
-            Write-Host "This profile requires Powershell Core, which is currently not installed!" -ForegroundColor Red
+        # WinGet updates the persisted PATH, not this already-running process. Resolve the
+        # standard install locations as well as the current PATH before deciding it failed.
+        $pwshPath = Get-WinUtilPowerShell7Path
+        if (-not $pwshPath) {
+            throw "PowerShell 7 could not be installed, so the profile cannot be set up."
         }
     }
+
+    Step-WinUtilJob -Status "Running the profile setup" -State "Indeterminate"
+
+    $setupUrl = "https://github.com/ChrisTitusTech/powershell-profile/raw/main/setup.ps1"
+    # Stop in the child, so a setup failure is a nonzero exit rather than a logged error and a
+    # exit code of zero
+    $output = & $pwshPath -NoProfile -NonInteractive -Command "`$ErrorActionPreference = 'Stop'; irm '$setupUrl' | iex" 2>&1
+    $exitCode = $LASTEXITCODE
+
+    $failures = 0
+    foreach ($line in @($output)) {
+        if ($line -is [System.Management.Automation.ErrorRecord]) {
+            $failures++
+            Write-WinUtilErrorRecord -ErrorRecord $line -Component "Feature" -Context "PowerShell profile setup"
+        } elseif (-not [string]::IsNullOrWhiteSpace($line)) {
+            Write-WinUtilLog -Component "Feature" -Message ([string]$line).Trim()
+        }
+    }
+
+    if ($exitCode -ne 0) {
+        throw "The profile setup script exited with code $exitCode."
+    }
+
+    if ($failures -gt 0) {
+        throw "The profile setup script reported $failures error(s); see the log."
+    }
+
+    Write-WinUtilLog -Component "Feature" -Message "CTT PowerShell profile installed. Open a new PowerShell 7 session to use it."
 }
